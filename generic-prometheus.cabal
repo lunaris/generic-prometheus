@@ -1,0 +1,18 @@
+cabal-version: 2.4
+name:          generic-prometheus
+version:       0.1.0.0
+description:   See README.md
+build-type:    Simple
+
+library
+  hs-source-dirs: src
+  exposed-modules:
+    GenericPrometheus
+  build-depends:
+    , base
+    , generic-lens
+    , ghc-prim
+    , lens
+    , mtl
+    , prometheus
+  default-language: Haskell2010

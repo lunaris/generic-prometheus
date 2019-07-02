@@ -1,0 +1,5 @@
+resolver: lts-13.26
+packages:
+- .
+extra-deps:
+- prometheus-2.1.2@sha256:dbd20f6003bd0b4602433b67ced7696322ec486143efc12b1d452dd312152224

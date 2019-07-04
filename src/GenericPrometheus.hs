@@ -1,20 +1,25 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE TypeOperators #-}
 
 module GenericPrometheus where
 
 import GenericPrometheus.Lib
 
+import Control.Monad.IO.Class (MonadIO)
 import Control.Monad.Reader (MonadReader, ReaderT)
 import GHC.Generics (Generic)
 
 newtype App a
   = App (ReaderT Env IO a)
   deriving newtype (Applicative, Functor, Monad,
-                    MonadReader Env)
+                    MonadIO, MonadReader Env)
+  deriving (MonadPrometheus AppMetrics)
+    via (PrometheusT AppMetrics App)
 
 data Env
   = Env

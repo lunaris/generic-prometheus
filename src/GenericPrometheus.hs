@@ -24,6 +24,8 @@ module GenericPrometheus
   , Histogram (..)
   , HistogramUpperBounds
 
+  , MonadPrometheus (..)
+  , PrometheusT (..)
   , WhenMetrics
 
   , addCounter
@@ -158,24 +160,37 @@ type HistogramUpperBounds
 --  for this less-than-perfect (but functional, as best as I can tell)
 --  interface instead.
 
-type WhenMetrics has name metrics r m
+class MonadPrometheus (metrics :: Type) m | m -> metrics where
+  getMetrics :: m metrics
+
+newtype PrometheusT metrics m a
+  = PrometheusT (m a)
+  deriving (Applicative, Functor, Monad,
+            MonadIO, MonadReader r)
+
+instance ( MonadReader r m
+         , G.P.HasType metrics r
+         )
+      => MonadPrometheus metrics (PrometheusT metrics m) where
+  getMetrics =
+    Lens.view (G.P.typed @metrics)
+
+type WhenMetrics has name metrics m
   = ( MonadIO m
-    , MonadReader r m
-    , G.P.HasType metrics r
+    , MonadPrometheus metrics m
     , has name metrics
     )
 
 withMetric
-  :: forall metrics a b r m
+  :: forall metrics a b m
    . ( MonadIO m
-     , MonadReader r m
-     , G.P.HasType metrics r
+     , MonadPrometheus metrics m
      )
   => (metrics -> a)
   -> (a -> IO b)
   -> m b
 withMetric get update = do
-  ms <- Lens.view (G.P.typed @metrics)
+  ms <- getMetrics @metrics
   let c = get ms
   liftIO $ update c
 
@@ -189,8 +204,8 @@ withMetric get update = do
 --  addCounter @"example_counter" 5
 --  @
 addCounter
-  :: forall name metrics r m
-   . WhenMetrics HasCounter name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasCounter name metrics m
   => Int
   -> m ()
 addCounter =
@@ -202,8 +217,8 @@ addCounter =
 --  incCounter @"example_counter"
 --  @
 incCounter
-  :: forall name metrics r m
-   . WhenMetrics HasCounter name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasCounter name metrics m
   => m ()
 incCounter =
   withMetric @metrics (getCounter @name) Prom.M.Ctr.inc
@@ -214,8 +229,8 @@ incCounter =
 --  sampleCounter @"example_counter"
 --  @
 sampleCounter
-  :: forall name metrics r m
-   . WhenMetrics HasCounter name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasCounter name metrics m
   => m Prom.M.Ctr.CounterSample
 sampleCounter =
   withMetric @metrics (getCounter @name) Prom.M.Ctr.sample
@@ -227,8 +242,8 @@ sampleCounter =
 --  addAndSampleCounter @"example_counter" 5
 --  @
 addAndSampleCounter
-  :: forall name metrics r m
-   . WhenMetrics HasCounter name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasCounter name metrics m
   => Int
   -> m Prom.M.Ctr.CounterSample
 addAndSampleCounter =
@@ -291,8 +306,8 @@ instance GHasCounter name r
 --  addGauge @"example_gauge" 5.0
 --  @
 addGauge
-  :: forall name metrics r m
-   . WhenMetrics HasGauge name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasGauge name metrics m
   => Double
   -> m ()
 addGauge =
@@ -304,8 +319,8 @@ addGauge =
 --  subGauge @"example_gauge" 5.0
 --  @
 subGauge
-  :: forall name metrics r m
-   . WhenMetrics HasGauge name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasGauge name metrics m
   => Double
   -> m ()
 subGauge =
@@ -317,8 +332,8 @@ subGauge =
 --  incGauge @"example_gauge"
 --  @
 incGauge
-  :: forall name metrics r m
-   . WhenMetrics HasGauge name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasGauge name metrics m
   => m ()
 incGauge =
   withMetric @metrics (getGauge @name) Prom.M.Gg.inc
@@ -329,8 +344,8 @@ incGauge =
 --  incGauge @"example_gauge"
 --  @
 decGauge
-  :: forall name metrics r m
-   . WhenMetrics HasGauge name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasGauge name metrics m
   => m ()
 decGauge =
   withMetric @metrics (getGauge @name) Prom.M.Gg.dec
@@ -341,8 +356,8 @@ decGauge =
 --  setGauge @"example_gauge" 5.0
 --  @
 setGauge
-  :: forall name metrics r m
-   . WhenMetrics HasGauge name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasGauge name metrics m
   => Double
   -> m ()
 setGauge =
@@ -354,8 +369,8 @@ setGauge =
 --  sampleGauge @"example_gauge"
 --  @
 sampleGauge
-  :: forall name metrics r m
-   . WhenMetrics HasGauge name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasGauge name metrics m
   => m Prom.M.Gg.GaugeSample
 sampleGauge =
   withMetric @metrics (getGauge @name) Prom.M.Gg.sample
@@ -367,8 +382,8 @@ sampleGauge =
 --  modifyAndSampleGauge @"example_gauge" (2 *)
 --  @
 modifyAndSampleGauge
-  :: forall name metrics r m
-   . WhenMetrics HasGauge name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasGauge name metrics m
   => (Double -> Double)
   -> m Prom.M.Gg.GaugeSample
 modifyAndSampleGauge =
@@ -431,8 +446,8 @@ instance GHasGauge name r
 --  observeHistogram @"example_histogram" 5.0
 --  @
 observeHistogram
-  :: forall name metrics r m
-   . WhenMetrics HasHistogram name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasHistogram name metrics m
   => Double
   -> m ()
 observeHistogram =
@@ -445,8 +460,8 @@ observeHistogram =
 --  sampleHistogram @"example_histogram"
 --  @
 sampleHistogram
-  :: forall name metrics r m
-   . WhenMetrics HasHistogram name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasHistogram name metrics m
   => m Prom.M.Histo.HistogramSample
 sampleHistogram =
   withMetric @metrics (getHistogram @name) Prom.M.Histo.sample
@@ -458,8 +473,8 @@ sampleHistogram =
 --  observeAndSampleHistogram @"example_histogram" 5.0
 --  @
 observeAndSampleHistogram
-  :: forall name metrics r m
-   . WhenMetrics HasHistogram name metrics r m
+  :: forall name metrics m
+   . WhenMetrics HasHistogram name metrics m
   => Double
   -> m Prom.M.Histo.HistogramSample
 observeAndSampleHistogram =

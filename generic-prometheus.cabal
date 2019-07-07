@@ -11,12 +11,13 @@ library
   build-depends:
     , async
     , base
-    , containers
     , generic-lens
-    , ghc-prim
     , lens
     , mtl
-    , prometheus
+    , prometheus-client
+    , prometheus-metrics-ghc
     , text
+    , wai-middleware-prometheus
+    , warp
   default-language: Haskell2010
   ghc-options: -Wall -Werror

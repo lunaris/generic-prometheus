@@ -5,19 +5,27 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
+{-# OPTIONS_GHC -Wnot #-}
+
 module GenericPrometheus
-  ( Labels
+  ( module GenericPrometheus
+  , Prom.Wai.metricsApp
+  )
+
+  {-( Labels
   , (:=)
   , Counter (..)
   , Gauge (..)
@@ -42,13 +50,13 @@ module GenericPrometheus
   , setGauge
   , sampleGauge
   , modifyAndSampleGauge
-  , Prom.M.Gg.GaugeSample (..)
+  , Prom.GaugeSample (..)
   , HasGauge (..)
 
   , observeHistogram
   , sampleHistogram
   , observeAndSampleHistogram
-  , Prom.M.Histo.HistogramSample (..)
+  , Prom.HistogramSample (..)
   , HasHistogram (..)
 
   , forkMetricsServer
@@ -59,7 +67,7 @@ module GenericPrometheus
   , labelsVal
   , KnownLabels (..)
   , KnownUpperBounds (..)
-  ) where
+  )-} where
 
 import qualified Control.Concurrent.Async as Async
 import qualified Control.Lens as Lens
@@ -70,17 +78,15 @@ import Data.Functor (void)
 import qualified Data.Generics.Product as G.P
 import Data.Kind (Type)
 import qualified Data.Map.Strict as M
+import Data.String (IsString (..))
 import Data.Proxy (Proxy (..))
 import qualified Data.Text as Tx
 import qualified GHC.Generics as G
 import GHC.TypeLits (KnownNat, KnownSymbol, Nat, Symbol, natVal, symbolVal)
-import qualified System.Metrics.Prometheus.Http.Scrape as Prom.HTTP
-import qualified System.Metrics.Prometheus.MetricId as Prom.Id
-import qualified System.Metrics.Prometheus.Metric.Counter as Prom.M.Ctr
-import qualified System.Metrics.Prometheus.Metric.Gauge as Prom.M.Gg
-import qualified System.Metrics.Prometheus.Metric.Histogram as Prom.M.Histo
-import qualified System.Metrics.Prometheus.Concurrent.RegistryT as Prom.RT
-import qualified System.Metrics.Prometheus.Registry as Prom.R
+import qualified Network.Wai.Handler.Warp as Warp
+import qualified Network.Wai.Middleware.Prometheus as Prom.Wai
+import qualified Prometheus as Prom
+import Text.Read (readMaybe)
 
 -- |A list of @'( key, value )@ pairs, to be used when defining metrics.
 type Labels
@@ -89,6 +95,70 @@ type Labels
 -- |A synonym for constructing labels as @'( key, value )@ pairs.
 type k := v
   = '(k, v)
+
+newtype Vector (labels :: [Symbol]) (metric :: Type)
+  = Vector (Prom.Vector (LabelList labels) metric)
+
+withLabel
+  :: forall name labels metric promMetric metrics m
+   . ( MonadIO m
+     , MonadPrometheus metrics m
+     , G.Generic metrics
+     , GHasMetric (Vector labels) name promMetric (G.Rep metrics)
+     , promMetric ~ Prom.Vector (LabelList labels) metric
+     , KnownLabels labels
+     )
+  => LabelList labels
+  -> (metric -> IO ())
+  -> m ()
+withLabel ls k = do
+  ms <- getMetrics @metrics
+  let m = ggetMetric @_ @(Vector labels) @name @promMetric (G.from ms)
+  liftIO $ Prom.withLabel m ls k
+
+class HasVector (name :: Symbol) (labels :: [Symbol]) (metric :: Type) (metrics :: Type) where
+  getVector :: metrics -> Prom.Vector (LabelList labels) metric
+
+instance ( G.Generic metrics
+         , GHasMetric (Vector labels) name (Prom.Vector (LabelList labels) metric) (G.Rep metrics)
+         )
+      => HasVector name labels metric metrics where
+  getVector =
+    ggetMetric @_ @(Vector labels) @name . G.from
+
+data LabelList :: [Symbol] -> Type where
+  LNil  :: LabelList '[]
+  LCons :: Tx.Text -> LabelList labels -> LabelList (label ': labels)
+
+class KnownLabels (labels :: [Symbol]) where
+  labelListVal
+    :: LabelList labels
+  labelListPairs
+    :: LabelList labels
+    -> LabelList labels
+    -> Prom.LabelPairs
+
+instance KnownLabels '[] where
+  labelListVal =
+    LNil
+  labelListPairs _ _ =
+    []
+
+instance ( KnownSymbol label
+         , KnownLabels labels
+         )
+      => KnownLabels (label ': labels) where
+  labelListVal =
+    LCons (symbolStr @label) (labelListVal @labels)
+  labelListPairs (LCons l1 ls1) (LCons l2 ls2) =
+    (l1, l2) : labelListPairs ls1 ls2
+
+instance KnownLabels labels => Prom.Label (LabelList labels) where
+  labelPairs =
+    labelListPairs
+
+deriving instance Eq (LabelList labels)
+deriving instance Ord (LabelList labels)
 
 -- |A Prometheus counter with the given name and set of labels.
 --
@@ -99,8 +169,8 @@ type k := v
 --        , _mCounter :: Counter "example_counter" '[ "l1" := "v1" ]
 --        }
 --  @
-newtype Counter (name :: Symbol) (labels :: Labels)
-  = Counter Prom.M.Ctr.Counter
+newtype Counter (name :: Symbol) (description :: Symbol)
+  = Counter Prom.Counter
 
 -- |A Prometheus gauge with the given name and set of labels.
 --
@@ -111,8 +181,8 @@ newtype Counter (name :: Symbol) (labels :: Labels)
 --        , _mGauge :: Gauge "example_gauge" '[ "l1" := "v1" ]
 --        }
 --  @
-newtype Gauge (name :: Symbol) (labels :: Labels)
-  = Gauge Prom.M.Gg.Gauge
+newtype Gauge (name :: Symbol) (description :: Symbol)
+  = Gauge Prom.Gauge
 
 -- |A Prometheus histogram with the given name, label set and buckets, defined
 --  by their successive upper bounds.
@@ -124,12 +194,8 @@ newtype Gauge (name :: Symbol) (labels :: Labels)
 --        , _mHistogram :: Histogram "example_histogram" '[ "l1" := "v1" ] '[ 10, 20, 30 ]
 --        }
 --  @
-newtype Histogram (name :: Symbol) (labels :: Labels) (upperBounds :: HistogramUpperBounds)
-  = Histogram Prom.M.Histo.Histogram
-
--- |A list of upper bounds, to be used when defining @Histogram@ buckets.
-type HistogramUpperBounds
-  = [Nat]
+newtype Histogram (name :: Symbol) (description :: Symbol) (buckets :: [Symbol])
+  = Histogram Prom.Histogram
 
 --  This is not the ideal interface. Ideally we'd put methods like @incCounter@
 --  et. al in a type class so that e.g. tests could perfectly mock Prometheus
@@ -194,6 +260,20 @@ withMetric get update = do
   let c = get ms
   liftIO $ update c
 
+with
+  :: forall metric name promMetric metrics m a
+   . ( MonadIO m
+     , MonadPrometheus metrics m
+     , G.Generic metrics
+     , GHasMetric metric name promMetric (G.Rep metrics)
+     )
+  => (promMetric -> IO a)
+  -> m a
+with k = do
+  ms <- getMetrics @metrics
+  let m = ggetMetric @_ @metric @name (G.from ms)
+  liftIO $ k m
+
 --------------------------------------------------------------------------------
 --  Counters
 --------------------------------------------------------------------------------
@@ -203,13 +283,13 @@ withMetric get update = do
 --  @
 --  addCounter @"example_counter" 5
 --  @
-addCounter
-  :: forall name metrics m
-   . WhenMetrics HasCounter name metrics m
-  => Int
-  -> m ()
-addCounter =
-  withMetric @metrics (getCounter @name) . Prom.M.Ctr.add
+-- addCounter
+--   :: forall name metrics m
+--    . WhenMetrics HasCounter name metrics m
+--   => Double
+--   -> m Bool
+-- addCounter =
+--   withMetric @metrics (getCounter @name) . flip Prom.addCounter
 
 -- |Increments the specified counter.
 --
@@ -221,80 +301,35 @@ incCounter
    . WhenMetrics HasCounter name metrics m
   => m ()
 incCounter =
-  withMetric @metrics (getCounter @name) Prom.M.Ctr.inc
+  withMetric @metrics (getCounter @name) Prom.incCounter
+
+incC :: Prom.Counter -> IO ()
+incC =
+  Prom.incCounter
 
 -- |Samples the specified counter, returning the current count.
 --
 --  @
 --  sampleCounter @"example_counter"
 --  @
-sampleCounter
-  :: forall name metrics m
-   . WhenMetrics HasCounter name metrics m
-  => m Prom.M.Ctr.CounterSample
-sampleCounter =
-  withMetric @metrics (getCounter @name) Prom.M.Ctr.sample
-
--- |Adds the given amount to the specified counter and thereafter samples it,
---  returning the new count.
---
---  @
---  addAndSampleCounter @"example_counter" 5
---  @
-addAndSampleCounter
-  :: forall name metrics m
-   . WhenMetrics HasCounter name metrics m
-  => Int
-  -> m Prom.M.Ctr.CounterSample
-addAndSampleCounter =
-  withMetric @metrics (getCounter @name) . Prom.M.Ctr.addAndSample
+-- sampleCounter
+--   :: forall name metrics m
+--    . WhenMetrics HasCounter name metrics m
+--   => m Double
+-- sampleCounter =
+--   withMetric @metrics (getCounter @name) Prom.getCounter
 
 -- |The class of types which have a @Counter@ metric with the supplied @name@.
 class HasCounter (name :: Symbol) (metrics :: Type) where
-  getCounter :: metrics -> Prom.M.Ctr.Counter
+  getCounter :: metrics -> Prom.Counter
 
 instance {-# OVERLAPPABLE #-}
          ( G.Generic metrics
-         , GHasCounter name (G.Rep metrics)
+         , GHasMetric Counter name Prom.Counter (G.Rep metrics)
          )
       => HasCounter name metrics where
   getCounter =
-    ggetCounter @name . G.from
-
-class GHasCounter (name :: Symbol) (rep :: Type -> Type) where
-  ggetCounter :: rep x -> Prom.M.Ctr.Counter
-
-instance GHasCounter name (G.S1 m (G.Rec0 (Counter name labels))) where
-  ggetCounter (G.M1 (G.K1 (Counter ctr))) =
-    ctr
-
-instance GHasCounter name rep => GHasCounter name (G.D1 m rep) where
-  ggetCounter =
-    ggetCounter @name . G.unM1
-
-instance GHasCounter name rep => GHasCounter name (G.C1 m rep) where
-  ggetCounter =
-    ggetCounter @name . G.unM1
-
-instance ( HasMetric (Counter name labels) (l G.:*: r) ~ lr
-         , GProductHasCounter lr name (l G.:*: r)
-         )
-      => GHasCounter name (l G.:*: r) where
-  ggetCounter =
-    ggetProductCounter @(HasMetric (Counter name labels) (l G.:*: r)) @name
-
-class GProductHasCounter (lr :: Bool) (name :: Symbol) (rep :: Type -> Type) where
-  ggetProductCounter :: rep x -> Prom.M.Ctr.Counter
-
-instance GHasCounter name l
-      => GProductHasCounter 'True name (l G.:*: r) where
-  ggetProductCounter (x G.:*: _) =
-    ggetCounter @name x
-
-instance GHasCounter name r
-      => GProductHasCounter 'False name (l G.:*: r) where
-  ggetProductCounter (_ G.:*: y) =
-    ggetCounter @name y
+    ggetMetric @_ @Counter @name . G.from
 
 --------------------------------------------------------------------------------
 --  Gauges
@@ -305,136 +340,87 @@ instance GHasCounter name r
 --  @
 --  addGauge @"example_gauge" 5.0
 --  @
-addGauge
-  :: forall name metrics m
-   . WhenMetrics HasGauge name metrics m
-  => Double
-  -> m ()
-addGauge =
-  withMetric @metrics (getGauge @name) . Prom.M.Gg.add
+-- addGauge
+--   :: forall name metrics m
+--    . WhenMetrics HasGauge name metrics m
+--   => Double
+--   -> m ()
+-- addGauge =
+--   withMetric @metrics (getGauge @name) . flip Prom.addGauge
 
 -- |Subtracts the given amount from the specified gauge.
 --
 --  @
 --  subGauge @"example_gauge" 5.0
 --  @
-subGauge
-  :: forall name metrics m
-   . WhenMetrics HasGauge name metrics m
-  => Double
-  -> m ()
-subGauge =
-  withMetric @metrics (getGauge @name) . Prom.M.Gg.sub
+-- subGauge
+--   :: forall name metrics m
+--    . WhenMetrics HasGauge name metrics m
+--   => Double
+--   -> m ()
+-- subGauge =
+--   withMetric @metrics (getGauge @name) . flip Prom.subGauge
 
 -- |Increments the specified gauge.
 --
 --  @
 --  incGauge @"example_gauge"
 --  @
-incGauge
-  :: forall name metrics m
-   . WhenMetrics HasGauge name metrics m
-  => m ()
-incGauge =
-  withMetric @metrics (getGauge @name) Prom.M.Gg.inc
+-- incGauge
+--   :: forall name metrics m
+--    . WhenMetrics HasGauge name metrics m
+--   => m ()
+-- incGauge =
+--   withMetric @metrics (getGauge @name) Prom.incGauge
 
 -- |Decrements the specified gauge.
 --
 --  @
 --  incGauge @"example_gauge"
 --  @
-decGauge
-  :: forall name metrics m
-   . WhenMetrics HasGauge name metrics m
-  => m ()
-decGauge =
-  withMetric @metrics (getGauge @name) Prom.M.Gg.dec
+-- decGauge
+--   :: forall name metrics m
+--    . WhenMetrics HasGauge name metrics m
+--   => m ()
+-- decGauge =
+--   withMetric @metrics (getGauge @name) Prom.decGauge
 
 -- |Sets the specified gauge to the given value.
 --
 --  @
 --  setGauge @"example_gauge" 5.0
 --  @
-setGauge
-  :: forall name metrics m
-   . WhenMetrics HasGauge name metrics m
-  => Double
-  -> m ()
-setGauge =
-  withMetric @metrics (getGauge @name) . Prom.M.Gg.set
+-- setGauge
+--   :: forall name metrics m
+--    . WhenMetrics HasGauge name metrics m
+--   => Double
+--   -> m ()
+-- setGauge =
+--   withMetric @metrics (getGauge @name) . flip Prom.setGauge
 
 -- |Samples the specified gauge, returning the current value.
 --
 --  @
 --  sampleGauge @"example_gauge"
 --  @
-sampleGauge
-  :: forall name metrics m
-   . WhenMetrics HasGauge name metrics m
-  => m Prom.M.Gg.GaugeSample
-sampleGauge =
-  withMetric @metrics (getGauge @name) Prom.M.Gg.sample
-
--- |Applies the given function to the specified gauge's current value before
---  sampling the gauge and returning the new value.
---
---  @
---  modifyAndSampleGauge @"example_gauge" (2 *)
---  @
-modifyAndSampleGauge
-  :: forall name metrics m
-   . WhenMetrics HasGauge name metrics m
-  => (Double -> Double)
-  -> m Prom.M.Gg.GaugeSample
-modifyAndSampleGauge =
-  withMetric @metrics (getGauge @name) . Prom.M.Gg.modifyAndSample
+-- sampleGauge
+--   :: forall name metrics m
+--    . WhenMetrics HasGauge name metrics m
+--   => m Double
+-- sampleGauge =
+--   withMetric @metrics (getGauge @name) Prom.getGauge
 
 -- |The class of types which have a @Gauge@ metric with the supplied @name@.
 class HasGauge (name :: Symbol) (metrics :: Type) where
-  getGauge :: metrics -> Prom.M.Gg.Gauge
+  getGauge :: metrics -> Prom.Gauge
 
 instance {-# OVERLAPPABLE #-}
          ( G.Generic metrics
-         , GHasGauge name (G.Rep metrics)
+         , GHasMetric Gauge name Prom.Gauge (G.Rep metrics)
          )
       => HasGauge name metrics where
   getGauge =
-    ggetGauge @name . G.from
-
-class GHasGauge (name :: Symbol) (rep :: Type -> Type) where
-  ggetGauge :: rep x -> Prom.M.Gg.Gauge
-
-instance GHasGauge name (G.S1 m (G.Rec0 (Gauge name labels))) where
-  ggetGauge (G.M1 (G.K1 (Gauge ctr))) =
-    ctr
-
-instance GHasGauge name rep => GHasGauge name (G.D1 m rep) where
-  ggetGauge =
-    ggetGauge @name . G.unM1
-
-instance GHasGauge name rep => GHasGauge name (G.C1 m rep) where
-  ggetGauge =
-    ggetGauge @name . G.unM1
-
-instance ( HasMetric (Gauge name labels) (l G.:*: r) ~ lr
-         , GProductHasGauge lr name (l G.:*: r)
-         )
-      => GHasGauge name (l G.:*: r) where
-  ggetGauge =
-    ggetProductGauge @(HasMetric (Gauge name labels) (l G.:*: r)) @name
-
-class GProductHasGauge (lr :: Bool) (name :: Symbol) (rep :: Type -> Type) where
-  ggetProductGauge :: rep x -> Prom.M.Gg.Gauge
-
-instance GHasGauge name l
-      => GProductHasGauge 'True name (l G.:*: r) where
-  ggetProductGauge (x G.:*: _) =
-    ggetGauge @name x
-
-instance GHasGauge name r
-      => GProductHasGauge 'False name (l G.:*: r) where
-  ggetProductGauge (_ G.:*: y) =
-    ggetGauge @name y
+    ggetMetric @_ @Gauge @name . G.from
 
 --------------------------------------------------------------------------------
 --  Histograms
@@ -445,13 +431,13 @@ instance GHasGauge name r
 --  @
 --  observeHistogram @"example_histogram" 5.0
 --  @
-observeHistogram
-  :: forall name metrics m
-   . WhenMetrics HasHistogram name metrics m
-  => Double
-  -> m ()
-observeHistogram =
-  withMetric @metrics (getHistogram @name) . Prom.M.Histo.observe
+-- observeHistogram
+--   :: forall name metrics m
+--    . WhenMetrics HasHistogram name metrics m
+--   => Double
+--   -> m ()
+-- observeHistogram =
+--   withMetric @metrics (getHistogram @name) . flip Prom.observe
 
 -- |Samples the specified histogram, returning information about the current
 --  distribution of observations.
@@ -459,195 +445,249 @@ observeHistogram =
 --  @
 --  sampleHistogram @"example_histogram"
 --  @
-sampleHistogram
-  :: forall name metrics m
-   . WhenMetrics HasHistogram name metrics m
-  => m Prom.M.Histo.HistogramSample
-sampleHistogram =
-  withMetric @metrics (getHistogram @name) Prom.M.Histo.sample
-
--- |Records an observation of the given value in the specified histogram before
---  sampling it and returning information about the new distribution.
---
---  @
---  observeAndSampleHistogram @"example_histogram" 5.0
---  @
-observeAndSampleHistogram
-  :: forall name metrics m
-   . WhenMetrics HasHistogram name metrics m
-  => Double
-  -> m Prom.M.Histo.HistogramSample
-observeAndSampleHistogram =
-  withMetric @metrics (getHistogram @name) . Prom.M.Histo.observeAndSample
+-- sampleHistogram
+--   :: forall name metrics m
+--    . WhenMetrics HasHistogram name metrics m
+--   => m (M.Map Double Int)
+-- sampleHistogram =
+--   withMetric @metrics (getHistogram @name) Prom.getHistogram
 
 -- |The class of types which have a @Histogram@ metric with the supplied @name@.
 class HasHistogram (name :: Symbol) (metrics :: Type) where
-  getHistogram :: metrics -> Prom.M.Histo.Histogram
+  getHistogram :: metrics -> Prom.Histogram
 
 instance {-# OVERLAPPABLE #-}
          ( G.Generic metrics
-         , GHasHistogram name (G.Rep metrics)
+         , GHasMetric Histogram name Prom.Histogram (G.Rep metrics)
          )
       => HasHistogram name metrics where
   getHistogram =
-    ggetHistogram @name . G.from
-
-class GHasHistogram (name :: Symbol) (rep :: Type -> Type) where
-  ggetHistogram :: rep x -> Prom.M.Histo.Histogram
-
-instance GHasHistogram name (G.S1 m (G.Rec0 (Histogram name labels upperBounds))) where
-  ggetHistogram (G.M1 (G.K1 (Histogram ctr))) =
-    ctr
-
-instance GHasHistogram name rep => GHasHistogram name (G.D1 m rep) where
-  ggetHistogram =
-    ggetHistogram @name . G.unM1
-
-instance GHasHistogram name rep => GHasHistogram name (G.C1 m rep) where
-  ggetHistogram =
-    ggetHistogram @name . G.unM1
-
-instance ( HasMetric (Histogram name labels upperBounds) (l G.:*: r) ~ lr
-         , GProductHasHistogram lr name (l G.:*: r)
-         )
-      => GHasHistogram name (l G.:*: r) where
-  ggetHistogram =
-    ggetProductHistogram @(HasMetric (Histogram name labels upperBounds) (l G.:*: r)) @name
-
-class GProductHasHistogram (lr :: Bool) (name :: Symbol) (rep :: Type -> Type) where
-  ggetProductHistogram :: rep x -> Prom.M.Histo.Histogram
-
-instance GHasHistogram name l
-      => GProductHasHistogram 'True name (l G.:*: r) where
-  ggetProductHistogram (x G.:*: _) =
-    ggetHistogram @name x
-
-instance GHasHistogram name r
-      => GProductHasHistogram 'False name (l G.:*: r) where
-  ggetProductHistogram (_ G.:*: y) =
-    ggetHistogram @name y
+    ggetMetric @_ @Histogram @name . G.from
 
 --------------------------------------------------------------------------------
 --  Construction and registration
 --------------------------------------------------------------------------------
 
--- |Forks a thread to serve metrics from the given @RegistrySample@ in a format
---  compatible with Prometheus' scraper. Metrics will be served at @/metrics@ on
---  the supplied port.
+-- |Forks a thread to serve metrics from the global metrics registry in a format
+--  compatible with Prometheus' scraper. Metrics will be served at any endpoint
+--  on the supplied port.
 forkMetricsServer
   :: MonadIO m
   => Int
-  -> IO Prom.R.RegistrySample
   -> m ()
-forkMetricsServer port sample = liftIO $ void $
-  Async.async $ Prom.HTTP.serveHttpTextMetrics port ["metrics"] sample
+forkMetricsServer port = liftIO $ void $
+  Async.async $ Warp.run port Prom.Wai.metricsApp
 
 -- |Generically constructs a record of metrics registered with a registry. Both
 --  the record of metrics and a @RegistrySample@ suitable for serving (e.g. with
 --  @forkMetricsServer@ are returned.
-mkMetrics
+registerMetrics
   :: forall a m
    . ( G.Generic a
-     , GConstructsMetrics (G.Rep a)
+     , GRegistersMetrics (G.Rep a)
      , MonadIO m
      )
-  => m (a, IO Prom.R.RegistrySample)
-mkMetrics = Prom.RT.runRegistryT $ do
-  ms <- G.to <$> gmkMetrics @(G.Rep a)
-  sample <- Prom.RT.sample
-  pure (ms, sample)
+  => m a
+registerMetrics = do
+  G.to <$> gregisterMetrics @(G.Rep a)
 
-class GConstructsMetrics (rep :: Type -> Type) where
-  gmkMetrics :: MonadIO m => Prom.RT.RegistryT m (rep x)
+class GRegistersMetrics (rep :: Type -> Type) where
+  gregisterMetrics :: MonadIO m => m (rep x)
+
+instance ( KnownLabels labels
+         , KnownSymbol name
+         , KnownSymbol description
+         )
+      => GRegistersMetrics (G.Rec0 (Vector labels (Counter name description))) where
+  gregisterMetrics =
+    fmap coerce $ Prom.register $ Prom.vector (labelListVal @labels) $
+      Prom.counter $ Prom.Info (symbolStr @name) (symbolStr @description)
 
 instance ( KnownSymbol name
-         , KnownLabels labels
+         , KnownSymbol description
          )
-      => GConstructsMetrics (G.S1 m (G.Rec0 (Counter name labels))) where
-  gmkMetrics =
-    coerce <$>
-      Prom.RT.registerCounter (symbolName @name) (labelsVal @labels)
+      => GRegistersMetrics (G.Rec0 (Counter name description)) where
+  gregisterMetrics =
+    fmap coerce $ Prom.register $ Prom.counter $
+      Prom.Info (symbolStr @name) (symbolStr @description)
 
 instance ( KnownSymbol name
-         , KnownLabels labels
+         , KnownSymbol description
          )
-      => GConstructsMetrics (G.S1 m (G.Rec0 (Gauge name labels))) where
-  gmkMetrics =
-    coerce <$>
-      Prom.RT.registerGauge (symbolName @name) (labelsVal @labels)
+      => GRegistersMetrics (G.Rec0 (Gauge name description)) where
+  gregisterMetrics =
+    fmap coerce $ Prom.register $ Prom.gauge $
+      Prom.Info (symbolStr @name) (symbolStr @description)
 
 instance ( KnownSymbol name
-         , KnownLabels labels
-         , KnownUpperBounds upperBounds
+         , KnownSymbol description
+         , KnownBuckets buckets
          )
-      => GConstructsMetrics
-          (G.S1 m (G.Rec0 (Histogram name labels upperBounds))) where
-  gmkMetrics =
-    coerce <$>
-      Prom.RT.registerHistogram (symbolName @name) (labelsVal @labels)
-        (upperBoundsVal @upperBounds)
+      => GRegistersMetrics (G.Rec0 (Histogram name description buckets)) where
+  gregisterMetrics =
+    case bucketsVal @buckets of
+      Nothing ->
+        --  Ideally we'd have type-level doubles/decimals, but in the absence
+        --  of those we'll try to parse @Symbol@s and use a runtime error to
+        --  notify the user if something went wrong.
+        error
+          $  "Buckets supplied for histogram '"
+          <> symbolStr @name
+          <> "' are not all valid Doubles"
+      Just bs ->
+        fmap coerce $ Prom.register $ Prom.histogram
+          (Prom.Info (symbolStr @name) (symbolStr @description)) bs
 
-instance GConstructsMetrics rep => GConstructsMetrics (G.D1 m rep) where
-  gmkMetrics =
-    G.M1 <$> gmkMetrics @rep
+instance GRegistersMetrics rep => GRegistersMetrics (G.S1 m rep) where
+  gregisterMetrics =
+    G.M1 <$> gregisterMetrics @rep
 
-instance GConstructsMetrics rep => GConstructsMetrics (G.C1 m rep) where
-  gmkMetrics =
-    G.M1 <$> gmkMetrics @rep
+instance GRegistersMetrics rep => GRegistersMetrics (G.C1 m rep) where
+  gregisterMetrics =
+    G.M1 <$> gregisterMetrics @rep
 
-instance (GConstructsMetrics l, GConstructsMetrics r)
-      =>  GConstructsMetrics (l G.:*: r) where
-  gmkMetrics =
-    (G.:*:) <$> gmkMetrics @l <*> gmkMetrics @r
+instance GRegistersMetrics rep => GRegistersMetrics (G.D1 m rep) where
+  gregisterMetrics =
+    G.M1 <$> gregisterMetrics @rep
+
+instance (GRegistersMetrics l, GRegistersMetrics r)
+      =>  GRegistersMetrics (l G.:*: r) where
+  gregisterMetrics =
+    (G.:*:) <$> gregisterMetrics @l <*> gregisterMetrics @r
 
 --------------------------------------------------------------------------------
 --  Utilities
 --------------------------------------------------------------------------------
 
-symbolName :: forall name. KnownSymbol name => Prom.Id.Name
-symbolName =
-  Prom.Id.Name (symbolText @name)
-
-symbolText :: forall name. KnownSymbol name => Tx.Text
-symbolText =
-  Tx.pack (symbolVal (Proxy @name))
+symbolStr :: forall name a. (KnownSymbol name, IsString a) => a
+symbolStr =
+  fromString (symbolVal (Proxy @name))
 
 natNum :: forall n a. (KnownNat n, Num a) => a
 natNum =
   fromInteger (natVal (Proxy @n))
 
-labelsVal :: forall labels. KnownLabels labels => Prom.Id.Labels
-labelsVal =
-  coerce (labelsMap @labels)
+--labelsVal :: forall labels. KnownLabels labels => Prom.Id.Labels
+--labelsVal =
+--  coerce (labelsMap @labels)
+--
+--class KnownLabels (labels :: Labels) where
+--  labelsMap :: M.Map Tx.Text Tx.Text
+--
+--instance KnownLabels '[] where
+--  labelsMap =
+--    M.empty
+--
+--instance ( KnownLabels labels
+--         , KnownSymbol k
+--         , KnownSymbol v
+--         )
+--      => KnownLabels ( '( k, v ) ': labels ) where
+--  labelsMap =
+--    M.insert (symbolStr @k) (symbolStr @v) (labelsMap @labels)
 
-class KnownLabels (labels :: Labels) where
-  labelsMap :: M.Map Tx.Text Tx.Text
+class KnownBuckets (buckets :: [Symbol]) where
+  bucketsVal :: Maybe [Double]
 
-instance KnownLabels '[] where
-  labelsMap =
-    M.empty
+instance KnownBuckets '[] where
+  bucketsVal =
+    Just []
 
-instance ( KnownLabels labels
-         , KnownSymbol k
-         , KnownSymbol v
+instance ( KnownBuckets buckets
+         , KnownSymbol b
          )
-      => KnownLabels ( '( k, v ) ': labels ) where
-  labelsMap =
-    M.insert (symbolText @k) (symbolText @v) (labelsMap @labels)
+      => KnownBuckets (b ': buckets) where
+  bucketsVal =
+    (:) <$> readMaybe (symbolStr @b) <*> bucketsVal @buckets
 
-class KnownUpperBounds (upperBounds :: HistogramUpperBounds) where
-  upperBoundsVal :: [Double]
+class GHasMetric (metric :: k) (name :: Symbol) (promMetric :: Type)
+                 (rep :: Type -> Type) where
+  ggetMetric :: rep x -> promMetric
 
-instance KnownUpperBounds '[] where
-  upperBoundsVal =
-    []
+instance GHasMetric Counter name Prom.Counter
+                    (G.Rec0 (Counter name description)) where
+  ggetMetric (G.K1 (Counter c)) =
+    c
 
-instance ( KnownUpperBounds upperBounds
-         , KnownNat ub
+instance GHasMetric Gauge name Prom.Gauge
+                    (G.Rec0 (Gauge name description)) where
+  ggetMetric (G.K1 (Gauge g)) =
+    g
+
+instance GHasMetric Histogram name Prom.Histogram
+                    (G.Rec0 (Histogram name description buckets)) where
+  ggetMetric (G.K1 (Histogram h)) =
+    h
+
+instance GHasMetric metric name promMetric rep
+      => GHasMetric metric name promMetric (G.S1 m rep) where
+  ggetMetric =
+    ggetMetric @_ @metric @name . G.unM1
+
+instance GHasMetric metric name promMetric rep
+      => GHasMetric metric name promMetric (G.C1 m rep) where
+  ggetMetric =
+    ggetMetric @_ @metric @name . G.unM1
+
+instance GHasMetric metric name promMetric rep
+      => GHasMetric metric name promMetric (G.D1 m rep) where
+  ggetMetric =
+    ggetMetric @_ @metric @name . G.unM1
+
+instance ( FindMetric metric name l ~ lr
+         , GProductHasMetric lr metric name promMetric (l G.:*: r)
          )
-      => KnownUpperBounds (ub ': upperBounds) where
-  upperBoundsVal =
-    natNum @ub : upperBoundsVal @upperBounds
+      => GHasMetric metric name promMetric (l G.:*: r) where
+  ggetMetric =
+    ggetProductMetric @_ @(FindMetric metric name l) @metric @name
+
+class GProductHasMetric (lr :: Maybe Type)
+                        (metric :: k) (name :: Symbol) (promMetric :: Type)
+                        (rep :: Type -> Type) where
+  ggetProductMetric :: rep x -> promMetric
+
+instance GHasMetric metric name promMetric l
+      => GProductHasMetric ('Just z) metric name promMetric (l G.:*: r) where
+  ggetProductMetric (x G.:*: _) =
+    ggetMetric @_ @metric @name x
+
+instance GHasMetric metric name promMetric r
+      => GProductHasMetric 'Nothing metric name promMetric (l G.:*: r) where
+  ggetProductMetric (_ G.:*: y) =
+    ggetMetric @_ @metric @name y
+
+type family FindMetric (metric :: k) (name :: Symbol) (rep :: Type -> Type) :: Maybe Type where
+  FindMetric (Vector labels metric) name
+    (G.Rec0 (Vector labels (Counter name _))) =
+      'Just (Prom.Vector (LabelList labels) Prom.Counter)
+  FindMetric (Vector labels metric) name
+    (G.Rec0 (Vector labels (Gauge name _))) =
+      'Just (Prom.Vector (LabelList labels) Prom.Gauge)
+  FindMetric (Vector labels metric) name
+    (G.Rec0 (Vector labels (Histogram name _ _))) =
+      'Just (Prom.Vector (LabelList labels) Prom.Histogram)
+
+  FindMetric Counter name (G.Rec0 (Counter name _)) =
+    'Just Prom.Counter
+  FindMetric Gauge name (G.Rec0 (Gauge name _)) =
+    'Just Prom.Gauge
+  FindMetric Histogram name (G.Rec0 (Histogram name _ _)) =
+    'Just Prom.Histogram
+
+  FindMetric metric name (l G.:*: r) =
+    FindMetric metric name l `Alt` FindMetric metric name r
+  FindMetric metric name (G.S1 _ rep) =
+    FindMetric metric name rep
+  FindMetric metric name (G.C1 _ rep) =
+    FindMetric metric name rep
+  FindMetric metric name (G.D1 _ rep) =
+    FindMetric metric name rep
+  FindMetric metric name (G.K1 _ _) =
+    'Nothing
+  FindMetric metric name G.U1 =
+    'Nothing
+  FindMetric metric name G.V1 =
+    'Nothing
 
 type family HasMetric (metric :: Type) (rep :: Type -> Type) :: Bool where
   HasMetric (Counter name _) (G.S1 _ (G.Rec0 (Counter name _))) =
@@ -676,3 +716,9 @@ type family HasMetric (metric :: Type) (rep :: Type -> Type) :: Bool where
 type family Or (a :: Bool) (b :: Bool) :: Bool where
   Or 'True b = 'True
   Or a     b = b
+
+type family Alt (mx :: Maybe k) (my :: Maybe k) :: Maybe k where
+  Alt ('Just x) _ =
+    'Just x
+  Alt _ y =
+    y

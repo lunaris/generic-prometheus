@@ -16,7 +16,9 @@ library
     , ghc-prim
     , lens
     , mtl
-    , prometheus
+    , prometheus-client
     , text
+    , wai-middleware-prometheus
+    , warp
   default-language: Haskell2010
   ghc-options: -Wall -Werror

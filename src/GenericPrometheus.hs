@@ -17,7 +17,15 @@
 {-# LANGUAGE UndecidableInstances #-}
 
 module GenericPrometheus
-  ( AMetric (..)
+  ( -- *Generic Prometheus metrics
+
+    -- $example
+
+    -- **Metric types
+
+    -- $metrics
+
+    AMetric (..)
   , AVector
 
   , Buckets (..)
@@ -59,17 +67,23 @@ module GenericPrometheus
   , Prom.withLabel
   , Prom.getVectorWith
 
+    -- **Construction and registration
+
   , registerMetrics
   , GRegistersMetrics (..)
   , ConstructableMetric (..)
 
   , Prom.register
+  , Prom.GHC.GHCMetrics
   , Prom.GHC.ghcMetrics
 
+    -- **Serving metrics
   , forkMetricsServer
 
+    -- **Labelling metrics
   , LabelList (..)
 
+    -- **Utilities
   , KnownSymbols (..)
   , KnownSymbolPairs (..)
   ) where
@@ -93,6 +107,176 @@ import qualified Network.Wai.Middleware.Prometheus as Prom.Wai
 import qualified Prometheus as Prom
 import qualified Prometheus.Metric.GHC as Prom.GHC
 import Text.Read (readMaybe)
+
+-- $example
+--
+-- The types and functions in this module are designed for use with @deriving
+-- via@ to enable adding Prometheus-compatible metrics to an application
+-- (structured as a program running in an environment with access to @IO@).
+-- Assuming that you have a @newtype@ representing such an application:
+--
+-- @
+-- newtype App a
+--   = App { _runApp :: ReaderT Env IO a }
+--   deriving newtype (Applicative, Functor, Monad,
+--                     MonadIO, MonadReader Env)
+--
+-- data Env
+--   = Env
+--       { ...
+--       }
+-- @
+--
+-- You can add support for Prometheus metrics by @deriving@ an instance of
+-- 'MonadPrometheus' @via@ this module's 'PrometheusT' type:
+--
+-- @
+-- import qualified GenericPrometheus as Prom
+--
+-- newtype App a
+--   = App { _runApp :: ReaderT Env IO a }
+--   ...
+--   deriving (Prom.MonadPrometheus Metrics)
+--     via (Prom.PrometheusT Metrics App)
+-- @
+--
+-- Doing so requires that your @Env@ type is @Generic@ and has a field of the
+-- type named in the 'MonadPrometheus' instance (here @Metrics@). This field
+-- should also be @Generic@ and consist only of metrics which can be generically
+-- constructed, as defined by the 'ConstructableMetric' class in this module:
+--
+-- @
+-- data Env
+--   = Env
+--       { ...
+--       , _eMetrics :: Metrics
+--       }
+--
+--   deriving (Generic)
+--
+-- data Metrics
+--   = Metrics
+--       { _msCounter
+--           :: Prom.AMetric "example_counter" "An example counter" Prom.Counter
+--       , _msVCounter
+--           :: Prom.AMetric "example_vcounter" "An example vector counter"
+--               (Prom.AVector '["method", "status"] Prom.Counter)
+--       , _msGauge
+--           :: Prom.AMetric "example_gauge" "An example gauge" Prom.Gauge
+--       , _msHistogram
+--           :: Prom.AMetric "example_histogram" "An example histogram"
+--               (Prom.AHistogram '["0.1", "0.25", "0.5", "1.0", "5.0", "10.0"])
+--       , _msSummary
+--           :: Prom.AMetric "example_summary" "An example summary"
+--              (Prom.ASummary '[ '( "0.5", "0.05" ), '( "0.9", "0.01" ), '( "0.99", "0.001" ) ])
+--       }
+--
+--   deriving (Generic)
+-- @
+--
+-- All you need do then is initialise and register such a set of metrics in your
+-- @main@ function (or similar) -- the 'registerMetrics' function takes care of
+-- just this task:
+--
+-- @
+-- main :: IO ()
+-- main = do
+--   ...
+--   env <- mkEnv ...
+--
+--   ... (runApp env) ...
+--
+-- mkEnv :: ... -> IO Env
+-- mkEnv ... = do
+--   metrics <- Prom.registerMetrics @Metrics
+--   ...
+--   pure Env
+--     { ...
+--     , _eMetrics = metrics
+--     }
+--
+-- runApp :: Env -> App a -> IO a
+-- runApp env (App m) =
+--   runReaderT m env
+-- @
+--
+-- Serving the metrics can be achieved by incorporating the 'metricsApp' WAI
+-- @Application@ into an existing HTTP flow or by using 'forkMetricsServer' to
+-- fork a thread running a Warp serve that serves any registered metrics on the
+-- given port:
+--
+-- @
+-- main = do
+--   ...
+--   Prom.forkMetricsServer 9090
+--
+--   ...
+-- @
+--
+-- You can then record metrics using 'withMetric' and standard functions from
+-- the @prometheus-client@ library; for example:
+--
+-- @
+-- Prom.withMetric _msCounter Prom.incCounter
+-- @
+--
+-- @
+-- Prom.withMetric _msGauge (Prom.setGauge 3.0)
+-- @
+--
+-- @
+-- Prom.withMetric _msVCounter $ \v ->
+--   Prom.withLabel v ("GET" :> "200" :> LNil) Prom.incCounter
+-- @
+
+-- $metrics
+--
+-- Broadly speaking, there are four types of Prometheus metrics:
+--
+-- * Counters
+-- * Gauges
+-- * Histograms
+-- * Summaries
+--
+-- Documentation on these can be found in the [Prometheus
+-- manual](https://prometheus.io/docs/concepts/metric_types/). Each has a type
+-- in this module:
+--
+-- * 'Counter'
+-- * 'Gauge'
+-- * 'Histogram'
+-- * 'Summary'
+--
+-- A fifth type, 'Vector', allows decorating any given metric with a set of
+-- labels, which allows parameterising a metric by some additional information
+-- (e.g. a counter of requests could have labels for HTTP method and status
+-- code, allowing it to count successful @GET@ requests, failed @POST@ requests,
+-- etc.).
+--
+-- When decorated by the 'AMetric' @newtype@, these types are all instances of
+-- 'ConstructableMetric', allowing them to be used in @Generic@ records which
+-- are to be automatically constructed and registered:
+--
+-- * @AMetric name description Counter@
+--
+-- * @AMetric name description Gauge@
+--
+-- * @AMetric name description (Buckets buckets Histogram)@
+--
+-- * @AMetric name description (Quantiles quantiles Summary)@
+--
+-- * @AMetric name description (Vector (LabelList labels) metric)@
+--
+-- Note that histograms, summaries and vectors take additional parameters as
+-- part of their construction, represented by the 'Buckets', 'Quantiles' and
+-- 'LabelList' types, respectively. A set of synonyms exist to make it slightly
+-- easier to work with these common cases:
+--
+-- * @AHistogram buckets@, equivalent to @Buckets buckets Histogram@.
+--
+-- * @ASummary quantiles@, equivalent to @Quantiles quantiles Summary@.
+--
+-- * @AVector labels metric@, equivalent to @Vector (LabelList labels) metric@.
 
 newtype AMetric (name :: Symbol) (description :: Symbol) (metric :: Type)
   = AMetric { _aMetric :: metric }
@@ -139,7 +323,8 @@ withMetric
 withMetric get k =
   getMetrics >>= liftIO . k . coerce . get
 
-class MonadPrometheus metrics m | m -> metrics where
+-- |The class of 'Monad's with access to a set of @metrics@.
+class Monad m => MonadPrometheus metrics m | m -> metrics where
   getMetrics :: m metrics
 
 newtype PrometheusT (metrics :: Type) (m :: Type -> Type) (a :: Type)
@@ -158,6 +343,7 @@ instance ( MonadReader r m
 --  Construction and registration
 --------------------------------------------------------------------------------
 
+-- |Constructs and registers a @Generic@ structure of 'ConstructableMetric's.
 registerMetrics
   :: forall a m
    . ( G.Generic a
@@ -198,6 +384,8 @@ instance (GRegistersMetrics l, GRegistersMetrics r)
   gregisterMetrics =
     (G.:*:) <$> gregisterMetrics @l <*> gregisterMetrics @r
 
+-- |The class of metrics which can be constructed from a @name@ and
+--  @description@.
 class ConstructableMetric (metric :: Type) where
   mkMetric :: Prom.Info -> Prom.Metric metric
 
@@ -250,6 +438,8 @@ instance KnownSymbolPairs quantiles
 --  Serving metrics
 --------------------------------------------------------------------------------
 
+-- |Forks a Warp server on the given port which will serve metrics on any
+--  endpoint.
 forkMetricsServer
   :: MonadIO m
   => Int
@@ -261,6 +451,12 @@ forkMetricsServer port = liftIO $ void $
 --  Labelling metrics
 --------------------------------------------------------------------------------
 
+-- |A list of label values indexed by 'Symbol's indicating the keys. For
+--  example:
+--
+--  @
+--  ("GET" :> "200" :> LNil) :: LabelList '["method", "status"]
+--  @
 data LabelList :: [Symbol] -> Type where
   LNil :: LabelList '[]
   (:>) :: Tx.Text -> LabelList labels -> LabelList (label ': labels)

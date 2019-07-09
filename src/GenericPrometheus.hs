@@ -140,9 +140,9 @@ import Text.Read (readMaybe)
 --     via (Prom.PrometheusT Metrics App)
 -- @
 --
--- Doing so requires that your @Env@ type is @Generic@ and has a field of the
+-- Doing so requires that your @Env@ type is 'G.Generic' and has a field of the
 -- type named in the 'MonadPrometheus' instance (here @Metrics@). This field
--- should also be @Generic@ and consist only of metrics which can be generically
+-- should also be 'G.Generic' and consist only of metrics which can be generically
 -- constructed, as defined by the 'ConstructableMetric' class in this module:
 --
 -- @
@@ -200,7 +200,7 @@ import Text.Read (readMaybe)
 --   runReaderT m env
 -- @
 --
--- Serving the metrics can be achieved by incorporating the 'metricsApp' WAI
+-- Serving the metrics can be achieved by incorporating the 'Prom.metricsApp' WAI
 -- @Application@ into an existing HTTP flow or by using 'forkMetricsServer' to
 -- fork a thread running a Warp serve that serves any registered metrics on the
 -- given port:
@@ -242,19 +242,19 @@ import Text.Read (readMaybe)
 -- manual](https://prometheus.io/docs/concepts/metric_types/). Each has a type
 -- in this module:
 --
--- * 'Counter'
--- * 'Gauge'
--- * 'Histogram'
--- * 'Summary'
+-- * 'Prom.Counter'
+-- * 'Prom.Gauge'
+-- * 'Prom.Histogram'
+-- * 'Prom.Summary'
 --
--- A fifth type, 'Vector', allows decorating any given metric with a set of
+-- A fifth type, 'Prom.Vector', allows decorating any given metric with a set of
 -- labels, which allows parameterising a metric by some additional information
 -- (e.g. a counter of requests could have labels for HTTP method and status
 -- code, allowing it to count successful @GET@ requests, failed @POST@ requests,
 -- etc.).
 --
 -- When decorated by the 'AMetric' @newtype@, these types are all instances of
--- 'ConstructableMetric', allowing them to be used in @Generic@ records which
+-- 'ConstructableMetric', allowing them to be used in 'G.Generic' records which
 -- are to be automatically constructed and registered:
 --
 -- * @AMetric name description Counter@
@@ -312,6 +312,23 @@ quantilesVal =
   where
     k = fmap toRational . readMaybe @Double
 
+-- |Inside some 'MonadPrometheus' @m@ with access to a record of metrics with
+--  type @metrics@, accepts a function to select a metric and a function to
+--  modify it and applies the modification appropriately. The metric being
+--  selected can be wrapped with arbitrary @newtype@s (e.g. 'Buckets',
+--  'Quantiles', etc.).
+--
+--  @
+--  --  Assuming the @Metrics@ record defined in the example:
+--  Prom.withMetric _msCounter Prom.incCounter
+--
+--  Prom.withMetric _msGauge (Prom.setGauge 3.0)
+--
+--  Prom.withMetric _msHistogram (Prom.observe 5.0)
+--
+--  Prom.withMetric _msVCounter $ \v ->
+--    Prom.withLabel v ("GET" :> "200" :> Prom.LNil) Prom.incCounter
+--  @
 withMetric
   :: ( MonadIO m
      , MonadPrometheus metrics m
@@ -327,6 +344,9 @@ withMetric get k =
 class Monad m => MonadPrometheus metrics m | m -> metrics where
   getMetrics :: m metrics
 
+-- |An identity 'Monad' transformer that can be used with @deriving via@ to
+--  derive a 'MonadPrometheus' instance which uses 'G.Generic's to find a
+--  @metrics@ record in an environment determined by 'MonadReader'.
 newtype PrometheusT (metrics :: Type) (m :: Type -> Type) (a :: Type)
   = PrometheusT (m a)
   deriving (Applicative, Functor, Monad,
@@ -343,7 +363,7 @@ instance ( MonadReader r m
 --  Construction and registration
 --------------------------------------------------------------------------------
 
--- |Constructs and registers a @Generic@ structure of 'ConstructableMetric's.
+-- |Constructs and registers a 'G.Generic' structure of 'ConstructableMetric's.
 registerMetrics
   :: forall a m
    . ( G.Generic a

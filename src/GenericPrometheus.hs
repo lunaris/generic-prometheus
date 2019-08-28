@@ -281,6 +281,7 @@ import Text.Read (readMaybe)
 newtype AMetric (name :: Symbol) (description :: Symbol) (metric :: Type)
   = AMetric { _aMetric :: metric }
   deriving stock (Eq, G.Generic, Ord, Show)
+  deriving newtype Prom.Observer
 
 type AVector (labels :: [Symbol]) (metric :: Type)
   = Prom.Vector (LabelList labels) metric
@@ -288,6 +289,7 @@ type AVector (labels :: [Symbol]) (metric :: Type)
 newtype Buckets (buckets :: [Symbol]) (metric :: Type)
   = Buckets { _buckets :: metric }
   deriving stock (Eq, G.Generic, Ord, Show)
+  deriving newtype Prom.Observer
 
 type AHistogram (buckets :: [Symbol])
   = Buckets buckets Prom.Histogram
@@ -299,6 +301,7 @@ bucketsVal =
 newtype Quantiles (quantiles :: [(Symbol, Symbol)]) (metric :: Type)
   = Quantiles { _quantiles :: metric }
   deriving stock (Eq, G.Generic, Ord, Show)
+  deriving newtype Prom.Observer
 
 type ASummary (quantiles :: [(Symbol, Symbol)])
   = Quantiles quantiles Prom.Summary

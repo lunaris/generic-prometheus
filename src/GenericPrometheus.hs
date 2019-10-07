@@ -94,7 +94,6 @@ import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.Reader (MonadReader)
 import Data.Bitraversable (bitraverse)
 import Data.Coerce (Coercible, coerce)
-import Data.Functor (void)
 import qualified Data.Generics.Product as G.P
 import Data.Kind (Type)
 import Data.Proxy (Proxy (..))
@@ -466,8 +465,8 @@ instance KnownSymbolPairs quantiles
 forkMetricsServer
   :: MonadIO m
   => Int
-  -> m ()
-forkMetricsServer port = liftIO $ void $
+  -> m (Async.Async ())
+forkMetricsServer port = liftIO $
   Async.async $ Warp.run port Prom.Wai.metricsApp
 
 --------------------------------------------------------------------------------

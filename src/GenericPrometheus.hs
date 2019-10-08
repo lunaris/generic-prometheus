@@ -4,10 +4,10 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -368,7 +368,7 @@ withMetric get k =
   getMetrics >>= k . coerce . get
 
 -- |The class of 'Monad's with access to a set of @metrics@.
-class Monad m => MonadPrometheus metrics m | m -> metrics where
+class Monad m => MonadPrometheus metrics m where
   getMetrics :: m metrics
 
 -- |An identity 'Monad' transformer that can be used with @deriving via@ to

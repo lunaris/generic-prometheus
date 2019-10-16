@@ -235,6 +235,16 @@ import Text.Read (readMaybe)
 -- Prom.withMetricIO _msVCounter $ \v ->
 --   Prom.withLabel v ("GET" :> "200" :> LNil) Prom.incCounter
 -- @
+--
+-- To keep track of the time taken by some part of your program, you should use
+-- 'observeDuration'. However, the action whose time you want to track might not
+-- be in 'IO'. In this case, 'withMetric' allows you to run the action in the
+-- same monad.
+--
+-- @
+-- Prom.withMetric _msSummary $ \metric -> Prom.observeDuration metric $ do
+--   getStuffFromDB
+-- @
 
 -- $metrics
 --
@@ -353,9 +363,12 @@ withMetricIO get k =
 -- |Inside some 'MonadPrometheus' @m@ with access to a record of metrics with
 --  type @metrics@, accepts a function to select a metric and a function to
 --  modify it and applies the modification appropriately. Contrary to
---  'withMetricIO', it does let you run the modification code in the same monad.
+--  'withMetricIO', it lets you run the modification code in the same monad.
 --
 --  @
+--  Prim.withMetric _msSummary $ \metric -> Prom.observeDuration metric $ do
+--    -- We remain in the same monad here.
+--    doSomething
 --  @
 withMetric
   :: ( MonadPrometheus metrics m

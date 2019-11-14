@@ -4,10 +4,10 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -40,6 +40,7 @@ module GenericPrometheus
   , PrometheusT (..)
 
   , withMetric
+  , withMetricIO
 
   , Prom.Counter
   , Prom.incCounter
@@ -53,6 +54,12 @@ module GenericPrometheus
   , Prom.decGauge
   , Prom.setGauge
   , Prom.getGauge
+
+  , Prom.MonadMonitor (..)
+  , Prom.Monitor
+  , Prom.runMonitor
+  , Prom.MonitorT
+  , Prom.runMonitorT
 
   , Prom.Observer (..)
   , Prom.observeDuration
@@ -212,20 +219,30 @@ import Text.Read (readMaybe)
 --   ...
 -- @
 --
--- You can then record metrics using 'withMetric' and standard functions from
+-- You can then record metrics using 'withMetricIO' and standard functions from
 -- the @prometheus-client@ library; for example:
 --
 -- @
--- Prom.withMetric _msCounter Prom.incCounter
+-- Prom.withMetricIO _msCounter Prom.incCounter
 -- @
 --
 -- @
--- Prom.withMetric _msGauge (Prom.setGauge 3.0)
+-- Prom.withMetricIO _msGauge (Prom.setGauge 3.0)
 -- @
 --
 -- @
--- Prom.withMetric _msVCounter $ \v ->
+-- Prom.withMetricIO _msVCounter $ \v ->
 --   Prom.withLabel v ("GET" :> "200" :> LNil) Prom.incCounter
+-- @
+--
+-- To keep track of the time taken by some part of your program, you should use
+-- 'observeDuration'. However, the action whose time you want to track might not
+-- be in 'IO'. In this case, 'withMetric' allows you to run the action in the
+-- same monad.
+--
+-- @
+-- Prom.withMetric _msSummary $ \metric -> Prom.observeDuration metric $ do
+--   getStuffFromDB
 -- @
 
 -- $metrics
@@ -322,16 +339,16 @@ quantilesVal =
 --
 --  @
 --  --  Assuming the @Metrics@ record defined in the example:
---  Prom.withMetric _msCounter Prom.incCounter
+--  Prom.withMetricIO _msCounter Prom.incCounter
 --
---  Prom.withMetric _msGauge (Prom.setGauge 3.0)
+--  Prom.withMetricIO _msGauge (Prom.setGauge 3.0)
 --
---  Prom.withMetric _msHistogram (Prom.observe 5.0)
+--  Prom.withMetricIO _msHistogram (Prom.observe 5.0)
 --
---  Prom.withMetric _msVCounter $ \v ->
+--  Prom.withMetricIO _msVCounter $ \v ->
 --    Prom.withLabel v ("GET" :> "200" :> Prom.LNil) Prom.incCounter
 --  @
-withMetric
+withMetricIO
   :: ( MonadIO m
      , MonadPrometheus metrics m
      , Coercible wrapped metric
@@ -339,11 +356,31 @@ withMetric
   => (metrics -> wrapped)
   -> (metric -> IO a)
   -> m a
+withMetricIO get k =
+  withMetric get (liftIO . k)
+
+-- |Inside some 'MonadPrometheus' @m@ with access to a record of metrics with
+--  type @metrics@, accepts a function to select a metric and a function to
+--  modify it and applies the modification appropriately. Contrary to
+--  'withMetricIO', it lets you run the modification code in the same monad.
+--
+--  @
+--  Prim.withMetric _msSummary $ \metric -> Prom.observeDuration metric $ do
+--    -- We remain in the same monad here.
+--    doSomething
+--  @
+withMetric
+  :: ( MonadPrometheus metrics m
+     , Coercible wrapped metric
+     )
+  => (metrics -> wrapped)
+  -> (metric -> m a)
+  -> m a
 withMetric get k =
-  getMetrics >>= liftIO . k . coerce . get
+  getMetrics >>= k . coerce . get
 
 -- |The class of 'Monad's with access to a set of @metrics@.
-class Monad m => MonadPrometheus metrics m | m -> metrics where
+class Monad m => MonadPrometheus metrics m where
   getMetrics :: m metrics
 
 -- |An identity 'Monad' transformer that can be used with @deriving via@ to

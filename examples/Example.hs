@@ -27,8 +27,8 @@ main = do
             threadDelay 2000000
           let method = if even x then "GET" else "POST"
               status = Tx.pack (show x) <> "00"
-          Prom.withMetric _msCounter Prom.incCounter
-          Prom.withMetric _msVCounter $ \v ->
+          Prom.withMetricIO _msCounter Prom.incCounter
+          Prom.withMetricIO _msVCounter $ \v ->
             Prom.withLabel v (method Prom.:> status Prom.:> Prom.LNil) Prom.incCounter
           go (if x == 4 then 1 else x + 1)
     go 1

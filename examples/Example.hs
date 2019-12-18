@@ -1,3 +1,4 @@
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingVia #-}
@@ -6,7 +7,7 @@
 {-# LANGUAGE StrictData #-}
 {-# LANGUAGE TypeApplications #-}
 
-module Example where
+module Main where
 
 import Control.Concurrent (threadDelay)
 import Control.Monad.IO.Class (MonadIO (..))
@@ -14,6 +15,10 @@ import Control.Monad.Reader (MonadReader (..), ReaderT (..))
 import qualified Data.Text as Tx
 import qualified GenericPrometheus as Prom
 import GHC.Generics (Generic)
+import qualified Control.Lens as Lens
+import qualified Data.Generics.Product as G.P
+
+import qualified Control.Monad.Reader as Rdr
 
 main :: IO ()
 main = do
@@ -30,6 +35,7 @@ main = do
           Prom.withMetricIO _msCounter Prom.incCounter
           Prom.withMetricIO _msVCounter $ \v ->
             Prom.withLabel v (method Prom.:> status Prom.:> Prom.LNil) Prom.incCounter
+          Prom.withMetric (_nsCounter . _msNested) Prom.incCounter
           go (if x == 4 then 1 else x + 1)
     go 1
 
@@ -47,6 +53,14 @@ newtype App a
                     MonadIO, MonadReader Env)
   deriving (Prom.MonadPrometheus Metrics)
     via (Prom.PrometheusT Metrics App)
+
+instance Prom.MonadMonitor App where
+  doIO = liftIO
+
+instance (Prom.MonadPrometheus NestedMetrics) App where
+  getMetrics = do
+    env <- Rdr.ask
+    pure $ Lens.view (G.P.typed @Metrics . G.P.typed @NestedMetrics) env
 
 runApp :: Env -> App a -> IO a
 runApp env (App m) =
@@ -74,6 +88,16 @@ data Metrics
       , _msSummary
           :: Prom.AMetric "example_summary" "An example summary"
               (Prom.ASummary '[ '( "0.5", "0.05" ), '( "0.9", "0.01" ), '( "0.99", "0.001" ) ])
+
+      , _msNested :: NestedMetrics
       }
 
+  deriving stock (Generic)
+
+-- Nested metric, could be imported from another package or library
+data NestedMetrics
+  = NestedMetrics
+      { _nsCounter
+          :: Prom.AMetric "nested_example_counter" "A nested example counter" Prom.Counter
+      }
   deriving stock (Generic)

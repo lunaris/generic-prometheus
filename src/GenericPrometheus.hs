@@ -410,13 +410,13 @@ registerMetrics
      , MonadIO m
      )
   => m a
-registerMetrics = do
+registerMetrics =
   G.to <$> gregisterMetrics @(G.Rep a)
 
 class GRegistersMetrics (rep :: Type -> Type) where
   gregisterMetrics :: MonadIO m => m (rep x)
 
-instance ( KnownSymbol name
+instance {-# OVERLAPPING #-} ( KnownSymbol name
          , KnownSymbol description
          , ConstructableMetric metric
          )
@@ -425,6 +425,12 @@ instance ( KnownSymbol name
     fmap coerce $ Prom.register $
       mkMetric @metric
         (Prom.Info (symbolStr @name) (symbolStr @description))
+
+instance {-# OVERLAPPABLE #-} ( GRegistersMetrics (G.Rep k)
+         , G.Generic k
+         )
+      => GRegistersMetrics (G.Rec0 k) where
+  gregisterMetrics = registerMetrics
 
 instance GRegistersMetrics rep => GRegistersMetrics (G.S1 m rep) where
   gregisterMetrics =
